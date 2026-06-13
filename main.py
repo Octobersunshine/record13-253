@@ -3,11 +3,14 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field, field_validator
+
+DEFAULT_TZ = "Asia/Shanghai"
 
 MATCHES: dict[str, "MatchEvent"] = {}
 REMINDER_LOG: dict[str, bool] = {}
@@ -16,6 +19,25 @@ ws_connections: list[WebSocket] = []
 scheduler = AsyncIOScheduler(timezone="UTC")
 
 _broadcaster_task: Optional[asyncio.Task] = None
+
+
+def parse_tz(tz_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=f"无效的时区: {tz_name}") from exc
+
+
+def to_utc(dt: datetime, tz: ZoneInfo) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return dt.astimezone(timezone.utc)
+
+
+def in_tz(dt: datetime, tz: ZoneInfo) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz)
 
 
 @asynccontextmanager
@@ -36,14 +58,25 @@ app = FastAPI(title="赛事倒计时服务", version="1.0.0", lifespan=lifespan)
 class MatchCreate(BaseModel):
     name: str = Field(..., description="赛事名称")
     start_time: datetime = Field(..., description="开赛时间 (ISO 8601)")
+    timezone: str = Field(DEFAULT_TZ, description="输入时间所属时区，默认 Asia/Shanghai (UTC+8)")
     reminder_minutes: int = Field(15, description="提前提醒分钟数", ge=1)
     webhook_url: Optional[str] = Field(None, description="Webhook 回调地址")
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"无效的时区: {v}") from exc
+        return v
 
 
 class MatchEvent(BaseModel):
     id: str
     name: str
-    start_time: datetime
+    start_time: datetime = Field(description="开赛时间 (UTC)")
+    timezone: str = Field(description="赛事本地时区")
     reminder_minutes: int
     webhook_url: Optional[str] = None
     reminded: bool = False
@@ -60,14 +93,9 @@ class MatchEvent(BaseModel):
         minutes, seconds = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-
-class ReminderPayload(BaseModel):
-    event: str = "match_reminder"
-    match_id: str
-    match_name: str
-    start_time: str
-    minutes_before: int
-    countdown: str
+    def start_time_in_tz(self, tz_name: Optional[str] = None) -> datetime:
+        tz = ZoneInfo(tz_name) if tz_name else ZoneInfo(self.timezone)
+        return in_tz(self.start_time, tz)
 
 
 async def send_webhook(url: str, payload: dict) -> None:
@@ -98,13 +126,17 @@ async def check_reminders() -> None:
         if now >= reminder_time:
             match.reminded = True
             REMINDER_LOG[match_id] = True
-            payload = ReminderPayload(
-                match_id=match.id,
-                match_name=match.name,
-                start_time=match.start_time.isoformat(),
-                minutes_before=match.reminder_minutes,
-                countdown=match.countdown_text,
-            ).model_dump()
+            local_tz = ZoneInfo(match.timezone)
+            payload = {
+                "event": "match_reminder",
+                "match_id": match.id,
+                "match_name": match.name,
+                "start_time_utc": match.start_time.isoformat(),
+                "start_time_local": in_tz(match.start_time, local_tz).isoformat(),
+                "timezone": match.timezone,
+                "minutes_before": match.reminder_minutes,
+                "countdown": match.countdown_text,
+            }
             await broadcast_ws(payload)
             if match.webhook_url:
                 await send_webhook(match.webhook_url, payload)
@@ -113,17 +145,22 @@ async def check_reminders() -> None:
 async def countdown_broadcaster() -> None:
     while True:
         if ws_connections:
+            matches_data = []
+            for m in MATCHES.values():
+                local_tz = ZoneInfo(m.timezone)
+                matches_data.append({
+                    "id": m.id,
+                    "name": m.name,
+                    "start_time_utc": m.start_time.isoformat(),
+                    "start_time_local": in_tz(m.start_time, local_tz).isoformat(),
+                    "timezone": m.timezone,
+                    "countdown": m.countdown_text,
+                    "countdown_seconds": m.countdown_seconds,
+                    "reminded": m.reminded,
+                })
             payload = {
                 "event": "countdown_tick",
-                "matches": [
-                    {
-                        "id": m.id,
-                        "name": m.name,
-                        "countdown": m.countdown_text,
-                        "reminded": m.reminded,
-                    }
-                    for m in MATCHES.values()
-                ],
+                "matches": matches_data,
             }
             await broadcast_ws(payload)
         await asyncio.sleep(1)
@@ -132,10 +169,13 @@ async def countdown_broadcaster() -> None:
 @app.post("/matches", response_model=MatchEvent, status_code=201)
 async def create_match(body: MatchCreate):
     match_id = uuid.uuid4().hex[:12]
+    tz = ZoneInfo(body.timezone)
+    start_time_utc = to_utc(body.start_time, tz)
     match = MatchEvent(
         id=match_id,
         name=body.name,
-        start_time=body.start_time,
+        start_time=start_time_utc,
+        timezone=body.timezone,
         reminder_minutes=body.reminder_minutes,
         webhook_url=body.webhook_url,
     )
@@ -144,17 +184,32 @@ async def create_match(body: MatchCreate):
     return match
 
 
-@app.get("/matches", response_model=list[MatchEvent])
-async def list_matches():
-    return list(MATCHES.values())
+@app.get("/matches")
+async def list_matches(tz: Optional[str] = Query(None, description="返回时间的时区，默认使用赛事本地时区")):
+    if tz:
+        target_tz = parse_tz(tz)
+    else:
+        target_tz = None
+    result = []
+    for m in MATCHES.values():
+        data = m.model_dump()
+        display_tz = target_tz if target_tz else ZoneInfo(m.timezone)
+        data["start_time_local"] = in_tz(m.start_time, display_tz).isoformat()
+        data["timezone_display"] = str(display_tz)
+        result.append(data)
+    return result
 
 
-@app.get("/matches/{match_id}", response_model=MatchEvent)
-async def get_match(match_id: str):
+@app.get("/matches/{match_id}")
+async def get_match(match_id: str, tz: Optional[str] = Query(None, description="返回时间的时区")):
     match = MATCHES.get(match_id)
     if not match:
         raise HTTPException(status_code=404, detail="赛事不存在")
-    return match
+    data = match.model_dump()
+    display_tz = ZoneInfo(tz) if tz else ZoneInfo(match.timezone)
+    data["start_time_local"] = in_tz(match.start_time, display_tz).isoformat()
+    data["timezone_display"] = str(display_tz)
+    return data
 
 
 @app.delete("/matches/{match_id}", status_code=204)
@@ -165,14 +220,17 @@ async def delete_match(match_id: str):
 
 
 @app.get("/matches/{match_id}/countdown")
-async def get_countdown(match_id: str):
+async def get_countdown(match_id: str, tz: Optional[str] = Query(None, description="返回时间的时区")):
     match = MATCHES.get(match_id)
     if not match:
         raise HTTPException(status_code=404, detail="赛事不存在")
+    display_tz = ZoneInfo(tz) if tz else ZoneInfo(match.timezone)
     return {
         "match_id": match.id,
         "name": match.name,
-        "start_time": match.start_time.isoformat(),
+        "start_time_utc": match.start_time.isoformat(),
+        "start_time_local": in_tz(match.start_time, display_tz).isoformat(),
+        "timezone": str(display_tz),
         "countdown_seconds": match.countdown_seconds,
         "countdown": match.countdown_text,
         "reminded": match.reminded,
